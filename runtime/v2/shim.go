@@ -106,10 +106,35 @@ func loadShim(ctx context.Context, bundle *Bundle, events *exchange.Exchange, rt
 	return s, nil
 }
 
-func cleanupAfterDeadShim(ctx context.Context, id, ns string, events *exchange.Exchange, binaryCall *binary) {
+func cleanupAfterDeadShim(ctx context.Context, id, ns string, events *exchange.Exchange, binaryCall *binary, bundle *Bundle, m *TaskManager) {
 	ctx = namespaces.WithNamespace(ctx, ns)
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	timeDuration := 5*time.Second
+	ctx, cancel := context.WithTimeout(ctx, timeDuration)
 	defer cancel()
+
+	// sleep for a while to wait shimv2 server start successfully
+	time.Sleep(timeDuration)
+	// try to reload the shim task, if reload failed, then cleanup it.
+	shim, err := loadShim(ctx, bundle, events, m.tasks, func() {
+		log.G(ctx).WithField("id", id).Info("shim disconnected")
+		_, err := m.tasks.Get(ctx, id)
+		if err != nil {
+			// Task was never started or was already successfully deleted
+			return
+		}
+		cleanupAfterDeadShim(context.Background(), id, ns, events, binaryCall, bundle, m)
+	})
+
+	// Remove self from the runtime task list. Even though the cleanupAfterDeadShim()
+	// would publish taskExit event, but the shim.Delete() would always failed with ttrpc
+	// disconnect and there is no chance to remove this dead task from runtime task lists.
+	// Thus it's better to delete it here.
+	m.tasks.Delete(ctx, id)
+
+	if err == nil {
+		m.tasks.Add(ctx, shim)
+		return
+	}
 
 	log.G(ctx).WithFields(logrus.Fields{
 		"id":        id,
